@@ -1,0 +1,1579 @@
+**********************************************************************
+Name:  BFLAppCreationAPI
+======================================================
+Purpose: Creation of CC Application, BRE Response record and Content Document for CIBIL report from the request recieved from BFL BRE
+======================================================
+
+***********************************************************************/
+
+@RestResource(urlMapping='/applicationCreate/*')
+global without sharing class BFLAppCreationAPI {
+    
+    public static BFLAppCreateResponseWrapper responseWrapper;
+    public static Map<String,String> queryMap = new Map<String,String>();
+    public static Map<String,String> dataMap = new Map<String,String>();
+    public static Map<String,Object> requestvalues;
+    public static Map<String,Object> responsevalues;
+    public static Map<String,Object> additionalInfo; 
+    public static Map<String, sObject> errorLogMap=new Map<String, sObject>();
+    public static List<sObject> errorlogList = new List<sObject>();
+    public static Map<String,sObject> logMap = new Map<String,sObject>(); 
+    public static List<sObject> logList = new List<sObject>();
+    public static String bureauResponse;
+    public static List<CC_Application_Data__c> ccObject; 
+    
+    @HttpPost
+    global static BFLAppCreateResponseWrapper getDetails()
+    {
+        DateTime startTime = System.now();
+        DateTime endTime = system.now();
+        List<Integration_Logger__c> integrationloggerlist = new List<Integration_Logger__c>();            
+        Integration_Logger__c integrationLogger = CommonUtil.integrationLogger('BFL_AppCreationAPI'); 
+        integrationLogger.Start_Time__c = System.now();        
+        
+        responseWrapper = new BFLAppCreateResponseWrapper();
+        try{
+            //way1 to get the data from request
+            Map<String,Object> maplist =(Map<String,Object>)JSON.deserializeUntyped(RestContext.request.requestBody.tostring());
+            Map<String,Object> request1 = (Map<String,Object>)((Map<String,Object>)maplist.get('ServiceRequest')).get('BFLRequest');
+            Map<String,Object> brerequest = (Map<String,Object>)request1.get('ServiceRequest');
+            
+            requestvalues = (Map<String,Object>)brerequest.get('RequestBody');
+            String bflUniqueID = (String)((Map<String,Object>)brerequest.get('RequestHeader')).get('ExternalApplicationID');//global static all maps
+            
+            Map<String,Object> response1 = (Map<String,Object>)((Map<String,Object>)maplist.get('ServiceRequest')).get('BFLResponse');
+            Map<String,Object> breresponse = (Map<String,Object>)response1.get('ServiceResponse');
+            responsevalues = (Map<String,Object>)breresponse.get('ResponseBody');
+            
+            additionalInfo = (Map<String,Object>)((Map<String,Object>)maplist.get('ServiceRequest')).get('AdditionalInfo');
+            
+            
+            bureauResponse = (String)((Map<String,Object>)maplist.get('ServiceRequest')).get('BureauResponse');
+            
+            
+            
+            
+            
+            //way1 to get the data from request
+            BFLAppCreateRequestWrapper requestWrapper = (BFLAppCreateRequestWrapper)JSON.deserialize(RestContext.request.requestBody.tostring(), BFLAppCreateRequestWrapper.class);        
+            
+            
+            responseWrapper.ExternalApplicationId = bflUniqueID;
+            
+            //generate the queryMap with mappings given in Integration_mdt
+            queryMap = WebServiceLogin.prepareOutboundQueryMap('AppCreation');
+            
+            //create CC App record with BRE request values
+            ccObject = createCCApplication(requestvalues,bflUniqueID,responsevalues);
+            if(ccObject ==null){ 
+                return responseWrapper;
+            }
+            
+            //generate App ref no -save in CC and send in response to BRE
+            //ccObject = [SELECT Id, First_Name__c,Last_Name__c,Name,CreatedDate,Net_Monthly_Income__c,Application_Reference_number__c FROM CC_Application_Data__c where Id =:ccObject[0].Id  WITH SECURITY_ENFORCED LIMIT 1];
+            
+            ccObject[0].BFLUniqueId__c = bflUniqueID;
+            //ccObject[0].Application_Reference_number__c = CommonUtil.getApplicationNumber('BFL','BFL',ccObject[0].Name);
+            
+            //save bre response object and ContentVersion with CIBIL data
+            BRE_Response__c breResp = createBRERespCIBIL(ccObject[0],responsevalues,additionalInfo,bureauResponse);
+            
+            
+            ccObject[0].CIBIL_Available__c=FALSE;
+            
+            //assign the BRE Decision to CC
+            if(breResp.IsError__c == 'False'){
+                if(ccObject[0] != NULL){
+                    if(breResp.Decision__c=='A'){
+                        ccObject[0].BRE_Approve__c = 'Approved';
+                        ccObject[0].BRE_Reject__c = '';
+                        ccObject[0].BRE_Refer__c = '';
+                        
+                        //Sujit Changes
+                        String placeholder3Value=breResp.Placeholder_3__c;
+                        if(placeholder3Value.equalsIgnoreCase('FCU_REQUIRED|N')){
+                           ccObject[0].Action__c = 'BRE Process Queue';
+                        }
+                        else{
+                             ccObject[0].Action__c = 'Application Moved to BFL FCU Pending queue';
+                        }
+                       
+                    }  
+                    else if(breResp.Decision__c=='D'){
+                        ccObject[0].BRE_Approve__c = '';
+                        ccObject[0].BRE_Reject__c = 'Reject';
+                        ccObject[0].BRE_Refer__c = '';
+                        ccObject[0].Action__c = 'BRE Reject Queue';
+                        ccObject[0].Disposition__c = 'BRE Reject Queue';
+                    }
+                    else if(breResp.Decision__c=='R'){
+                        ccObject[0].BRE_Approve__c = '';
+                        ccObject[0].BRE_Reject__c = '';
+                        ccObject[0].BRE_Refer__c = 'Refer';
+                    }
+                }
+            }
+            
+            //Audit Trail changes
+           /* APIProcessor app = new APIProcessor();
+            app.ccApplicationDataId =ccObject[0].id ;
+            app.performPlatformEventForStatus('App Creation API completed');
+            */
+            
+            //Sujit changes for Audit Trails, App creation completed missing
+            ccObject[0].Integration_Status__c='App Creation API completed';
+            
+            //assign the BRE decline reason code to CC
+            ccObject[0].Reject_Code__c = breResp.Reason_Code__c;
+            ccObject[0].BFL_FCU_Rules__c=ccObject[0].Reject_Code__c ;
+            
+            ccObject[0].Reject_Comments__c = breResp.Reason__c;
+            if (Schema.sObjectType.CC_Application_Data__c.isUpdateable()) {
+                update ccObject;
+            }
+            
+            responseWrapper.ApplicationID = ccObject[0].Application_Reference_number__c;
+            responseWrapper.IsError='FALSE';
+            responseWrapper.ErrorMsg='Transaction Successful';
+            
+            integrationLogger.Request__c = String.valueOf(requestWrapper);                                    
+            integrationLogger.CC_App_Data__c =ccObject[0].Id; 
+            integrationLogger.Response__c = String.valueOf(requestWrapper);                                    
+            integrationLogger.Application_No__c =ccObject[0].Application_Reference_number__c;
+            
+        }catch(Exception ex){
+            
+            responseWrapper.IsError='TRUE';
+            //responseWrapper.ErrorMsg=ex.getMessage() + ' Exception line number-->'+ ex.getLineNumber();
+            responseWrapper.ErrorMsg=System.Label.API_down_message; //There is some technical err contact sys admin
+            
+            IntegrationLogrWrapper.IntegrationErrorlog errorlogWrap = new IntegrationLogrWrapper.IntegrationErrorlog();
+            // errorlogWrap.appref=ccObject[0].Application_Reference_number__c;
+            errorlogWrap.ErrorMsg = ex.getStackTraceString();
+            errorlogWrap.errorTime=startTime;
+            errorlogWrap.lineNum=ex.getLineNumber();
+            errorlogWrap.message=ex.getMessage();
+            errorlogWrap.logName='BFL AppCreationAPI error log';
+            errorLogMap = CommonUtil.logErrorInfo(errorlogWrap);
+            errorlogList.add(errorLogMap.get('IntegrationErrorLog'));
+            insert errorlogList;
+            
+            //Audit Trail changes
+            //APIProcessor app = new APIProcessor();
+            //app.ccApplicationDataId =ccObject[0].id ;
+            //app.performPlatformEventForStatus('App Creation API Failed due to : '+ex.getMessage());
+            return responseWrapper;
+        }
+        commitIntegrationLogger(integrationloggerlist,integrationLogger);
+        
+        return responseWrapper;
+    }
+    
+    public static BRE_Response__c createBRERespCIBIL(CC_Application_Data__c ccObject,Map<String,Object> responsevalues,Map<String,Object> additionalInfo,String bureauResponse){
+        
+        Id bflbreReportType = [SELECT Name, Id FROM RecordType where Name='BFL BRE Response' WITH SECURITY_ENFORCED LIMIT 1].Id;
+        
+        
+        BRE_Response__c breResp = new BRE_Response__c();        
+        
+        breResp.Name =  'BRE-'+ccObject.Application_Reference_number__c;
+        breResp.API_NAME__c = 'BRE 1';
+        breResp.CC_Application_Data__c = ccObject.Id;
+        breResp.IsError__c = String.isNotBlank((String)responsevalues.get(queryMap.get('IsError__c')))?(String)responsevalues.get(queryMap.get('IsError__c')):'';
+        breResp.ErrorMsg__c = String.isNotBlank((String)responsevalues.get(queryMap.get('ErrorMsg__c')))?(String)responsevalues.get(queryMap.get('ErrorMsg__c')):'';
+        breResp.Program__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Program__c')))?(String)responsevalues.get(queryMap.get('Program__c')):'';
+        breResp.Is15PCurrentDPD__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('Is15PCurrentDPD__c')))?(String)responsevalues.get(queryMap.get('Is15PCurrentDPD__c')):'False');
+        breResp.Is30PDPDLast6M__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('Is30PDPDLast6M__c')))?(String)responsevalues.get(queryMap.get('Is30PDPDLast6M__c')):'False');
+        breResp.Is90PDPDLast12M__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('Is90PDPDLast12M__c')))?(String)responsevalues.get(queryMap.get('Is90PDPDLast12M__c')):'False');
+        breResp.Is60PDPDLast12M__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('Is60PDPDLast12M__c')))?(String)responsevalues.get(queryMap.get('Is60PDPDLast12M__c')):'False');
+        breResp.SingleOrMultiCarded__c = String.isNotBlank((String)responsevalues.get(queryMap.get('SingleOrMultiCarded__c')))?(String)responsevalues.get(queryMap.get('SingleOrMultiCarded__c')):'';
+        breResp.TotalAmountOverDue__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('TotalAmountOverDue__c')))?(String)responsevalues.get(queryMap.get('TotalAmountOverDue__c')):'0');
+        breResp.CurrOverDueLE12M__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('CurrOverDueLE12M__c')))?(String)responsevalues.get(queryMap.get('CurrOverDueLE12M__c')):'False');
+        breResp.IsWritOffSuitFiled__c = String.isNotBlank((String)responsevalues.get(queryMap.get('IsWritOffSuitFiled__c')))?(String)responsevalues.get(queryMap.get('IsWritOffSuitFiled__c')):'';
+        breResp.CCWritOffAmtPrincipal__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('CCWritOffAmtPrincipal__c')))?(String)responsevalues.get(queryMap.get('CCWritOffAmtPrincipal__c')):'0');
+        breResp.NCCWritOffAmtPrincipal__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('NCCWritOffAmtPrincipal__c')))?(String)responsevalues.get(queryMap.get('NCCWritOffAmtPrincipal__c')):'0');
+        breResp.CurrWOffLE36M__c = Boolean.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('CurrWOffLE36M__c')))?(String)responsevalues.get(queryMap.get('CurrWOffLE36M__c')):'False');
+        breResp.CardVintage__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('CardVintage__c')))?(String)responsevalues.get(queryMap.get('CardVintage__c')):'0');
+        breResp.LiveCardVintage__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('LiveCardVintage__c')))?(String)responsevalues.get(queryMap.get('LiveCardVintage__c')):'0');
+        breResp.MaxCreditLimit__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('MaxCreditLimit__c')))?(String)responsevalues.get(queryMap.get('MaxCreditLimit__c')):'0');
+        breResp.MaxSanctionAmountOrHighCredit__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('MaxSanctionAmountOrHighCredit__c')))?(String)responsevalues.get(queryMap.get('MaxSanctionAmountOrHighCredit__c')):'0');
+        breResp.NumOfUnsecuredEnquires_L3M__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('NumOfUnsecuredEnquires_L3M__c')))?(String)responsevalues.get(queryMap.get('NumOfUnsecuredEnquires_L3M__c')):'0');
+        breResp.NumOfUnsecuredEnquires_L6M__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('NumOfUnsecuredEnquires_L6M__c')))?(String)responsevalues.get(queryMap.get('NumOfUnsecuredEnquires_L6M__c')):'0');
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('ALStartDate__c')))){
+            breResp.ALStartDate__c = Date.parse(((String)responsevalues.get(queryMap.get('ALStartDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('BLStartDate__c')))){
+            breResp.BLStartDate__c = Date.parse(((String)responsevalues.get(queryMap.get('BLStartDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('PLStartDate__c')))){
+            breResp.PLStartDate__c = Date.parse(((String)responsevalues.get(queryMap.get('PLStartDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('ALClosedDate__c')))){
+            breResp.ALClosedDate__c = Date.parse(((String)responsevalues.get(queryMap.get('ALClosedDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('BLClosedDate__c')))){
+            breResp.BLClosedDate__c = Date.parse(((String)responsevalues.get(queryMap.get('BLClosedDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('PLClosedDate__c')))){
+            breResp.PLClosedDate__c = Date.parse(((String)responsevalues.get(queryMap.get('PLClosedDate__c'))).remove('\\'));
+        }
+        if(String.isNotBlank((String)responsevalues.get(queryMap.get('CCStartDate__c')))){
+            breResp.CCStartDate__c = Date.parse(((String)responsevalues.get(queryMap.get('CCStartDate__c'))).remove('\\'));
+        }
+        
+        breResp.LastCCDisbursedSanctionAmount__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('LastCCDisbursedSanctionAmount__c')))?(String)responsevalues.get(queryMap.get('LastCCDisbursedSanctionAmount__c')):'0');
+        breResp.TotalLoans__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('TotalLoans__c')))?(String)responsevalues.get(queryMap.get('TotalLoans__c')):'0');
+        breResp.TotalSecuredLoans__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('TotalSecuredLoans__c')))?(String)responsevalues.get(queryMap.get('TotalSecuredLoans__c')):'0');
+        breResp.AverageCCUtilization__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('AverageCCUtilization__c')))?(String)responsevalues.get(queryMap.get('AverageCCUtilization__c')):'0');
+        breResp.ProposedCreditLimit__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('ProposedCreditLimit__c')))?(String)responsevalues.get(queryMap.get('ProposedCreditLimit__c')):'0');
+        breResp.CreditLimitFlag__c = String.isNotBlank((String)responsevalues.get(queryMap.get('CreditLimitFlag__c')))?(String)responsevalues.get(queryMap.get('CreditLimitFlag__c')):'';
+        breResp.AppScore__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('AppScore__c')))?(String)responsevalues.get(queryMap.get('AppScore__c')):'0');
+        breResp.AppScoreBand__c = String.isNotBlank((String)responsevalues.get(queryMap.get('AppScoreBand__c')))?(String)responsevalues.get(queryMap.get('AppScoreBand__c')):'';
+        breResp.ImputedIncome__c = Decimal.valueOf(String.isNotBlank((String)responsevalues.get(queryMap.get('ImputedIncome__c')))?(String)responsevalues.get(queryMap.get('ImputedIncome__c')):'0');
+        breResp.Decision__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Decision__c')))?(String)responsevalues.get(queryMap.get('Decision__c')):'';
+        breResp.Reason_Code__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Reason_Code__c')))?(String)responsevalues.get(queryMap.get('Reason_Code__c')):'';
+        breResp.CardedOrNonCardedV2__c = String.isNotBlank((String)responsevalues.get(queryMap.get('CardedOrNonCardedV2__c')))?(String)responsevalues.get(queryMap.get('CardedOrNonCardedV2__c')):'';
+        breResp.MobileFlag__c = String.isNotBlank((String)responsevalues.get(queryMap.get('MobileFlag__c')))?(String)responsevalues.get(queryMap.get('MobileFlag__c')):'';
+        breResp.LeadSource__c = String.isNotBlank((String)responsevalues.get(queryMap.get('LeadSource__c')))?(String)responsevalues.get(queryMap.get('LeadSource__c')):'';
+        breResp.SourcingType__c = String.isNotBlank((String)responsevalues.get(queryMap.get('SourcingType__c')))?(String)responsevalues.get(queryMap.get('SourcingType__c')):'';
+        breResp.BureauName__c = String.isNotBlank((String)responsevalues.get(queryMap.get('BureauName__c')))?(String)responsevalues.get(queryMap.get('BureauName__c')):'';
+        breResp.GreenChannel__c = String.isNotBlank((String)responsevalues.get(queryMap.get('GreenChannel__c')))?(String)responsevalues.get(queryMap.get('GreenChannel__c')):'';
+        breResp.AddressWaiverFlag__c = String.isNotBlank((String)responsevalues.get(queryMap.get('AddressWaiverFlag__c')))?(String)responsevalues.get(queryMap.get('AddressWaiverFlag__c')):'';
+        breResp.Placeholder_1__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Placeholder_1__c')))?(String)responsevalues.get(queryMap.get('Placeholder_1__c')):'';
+        breResp.Placeholder_2__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Placeholder_2__c')))?(String)responsevalues.get(queryMap.get('Placeholder_2__c')):'';
+        breResp.Placeholder_3__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Placeholder_3__c')))?(String)responsevalues.get(queryMap.get('Placeholder_3__c')):'';
+        breResp.Placeholder_4__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Placeholder_4__c')))?(String)responsevalues.get(queryMap.get('Placeholder_4__c')):'';
+        breResp.Placeholder_5__c = String.isNotBlank((String)responsevalues.get(queryMap.get('Placeholder_5__c')))?(String)responsevalues.get(queryMap.get('Placeholder_5__c')):'';
+        breResp.ReportNo__c = String.isNotBlank((String)responsevalues.get(queryMap.get('ReportNo__c')))?(String)responsevalues.get(queryMap.get('ReportNo__c')):'';
+        breResp.CIBILTUScore__c = String.isNotBlank((String)additionalInfo.get(queryMap.get('CIBILTUScore__c')))?(String)additionalInfo.get(queryMap.get('CIBILTUScore__c')):'';
+        breResp.RecordTypeId = bflbreReportType;
+        
+        if(breResp.Decision__c.equalsIgnoreCase('D') && String.isNotBlank(breResp.Reason_Code__c)){
+            List<String> reasonCodes = new List<String>();
+            String code = breResp.Reason_Code__c.remove('INCERR');//ignore INCERR - BRE created for their internal monitoring
+            //D031F001F002F005F006
+            Integer len = code.length()/4;            
+            if(Math.mod(code.length(),4) ==0){
+                //System.debug('**clen = '+code.length()/4);
+                for(Integer i=0;i<len;i++){
+                    //System.debug('**i = '+i);
+                    if(code.substring(0,4).containsIgnoreCase('D')){
+                        //System.debug('**code = '+code.substring(0,4));
+                        reasonCodes.add(code.substring(0,4));
+                    }
+                    code = code.remove(code.substring(0,4));
+                }
+            }
+            
+            breResp.Reason__c='';
+            for(BREReasons__c reasonObj:[SELECT Id, Name, Description__c FROM BREReasons__c WHERE Name IN :reasonCodes]){
+                breResp.Reason__c = breResp.Reason__c+reasonObj.Description__c+';';
+            }
+            
+        }
+        
+        
+        insert breResp;
+        //upsert breResp;
+        
+        
+        
+        //save or generate CIBIL report
+        
+        ContentVersion cibilConVer = new ContentVersion();
+        
+        String test = bureauResponse.unescapeXml();
+        Blob body = Blob.valueOf(test); 
+        
+        
+        String fileName = 'BRE1 '+ccObject.Application_Reference_number__c;
+        //ContentVersion conVer = new ContentVersion(); 
+        cibilConVer.ContentLocation = 'S'; // to use S specify this document is in Salesforce, to use E for external files
+        cibilConVer.PathOnClient = fileName +'.'+'txt'; 
+        cibilConVer.Title = fileName; 
+        cibilConVer.VersionData = body;
+        
+        List<NetworkMember> membership = [SELECT NetworkID, MemberID FROM NetworkMember
+                                          WHERE memberID = :UserInfo.getUserId() WITH SECURITY_ENFORCED];
+        if(membership != NULL && !membership.isEmpty() && membership.size() > 0 ){
+            cibilConver.NetworkId = membership[0].NetworkId;    
+        }
+        if(Schema.sObjectType.ContentVersion.isCreateable()) {
+            insert cibilConVer;
+        }
+        
+        Id conDoc = [SELECT ContentDocumentId FROM ContentVersion WHERE Id =:cibilConVer.Id].ContentDocumentId;
+        //create ContentDocumentLink  record 
+        if(conDoc!=null)
+        {
+            ContentDocumentLink conDocLink = New ContentDocumentLink();
+            conDocLink.LinkedEntityId = breResp.Id;
+            conDocLink.ContentDocumentId = conDoc;  
+            conDocLink.shareType = 'V';
+            if(Schema.sObjectType.ContentDocumentLink.isCreateable()) {
+                insert conDocLink; 
+                
+            }
+        }
+        
+        
+        return breResp;
+        
+    }
+    
+    public static List<CC_Application_Data__c> createCCApplication(Map<String,Object> requestvalues,String bflUniqueID,Map<String,Object> responsevalues){
+        
+        Id bflReportType = [SELECT Name, Id FROM RecordType where Name='BFL Application' WITH SECURITY_ENFORCED LIMIT 1].Id;
+        
+        List<CC_Application_Data__c> ccObjList = [Select Id,Disposition__c,Residence_Landmark__c,Perm_Address_Line_1__c,Perm_Address_Line_2__c,
+                                                  Permanent_Address_Line3__c,Permanent_Landmark__c,Permanent_City__c,Permanent_State__c,
+                                                  Permanent_Country__c,Permanent_Pincode__c,Employer_Name__c,Marital_Status__c,Preferred_Mailing_Address__c,
+                                                  Bureau_Credit_Limit__c,Employment_Type__c,Fourth_line_embosser__c,Designation__c,Relationship_Manager_Name__c,
+                                                  Office_Country__c,Statement_preference__c,Residence_Country__c,BFLUniqueId__c,Fee_Code__c,Override_Fee_Code__c,
+                                                  Name_on_Card__c,RBL_BFL_Status__c,Upsell_File_Upload__c,Channel_Type__c,LeadSource__c,Promo_Code__c,Card_Type__c,
+                                                  Salutation__c,First_Name__c,Middle_Name__c,Last_Name__c,DOB__c,Gender__c,BRE_Reject__c,Program_GoNoGoBRE__c,PAN__c,
+                                                  Email__c,Mobile_No__c,Residence_Address_Line_1__c,Residence_Address_Line_2__c,Residence_Address_Line_3__c,
+                                                  Residence_Pincode__c,Residence_City__c,Residence_State__c,Office_Address_Line_1__c,Office_Address_Line_2__c,
+                                                  Office_Address_Line_3__c,Office_Pincode__c,Office_City__c,Office_State__c,Office_Mobile__c,Net_Monthly_Income__c, RecordTypeId
+                                                  from CC_Application_Data__c where BFLUniqueId__c=:bflUniqueID];  
+        
+        List<CC_Application_Data__c> listObj = new List<CC_Application_Data__c>();
+        CC_Application_Data__c obj = new CC_Application_Data__c();
+        
+        
+        if(ccObjList.size()>0){//cc present 
+            obj.Id = ccObjList[0].Id;
+        }
+        
+        obj.Channel_Type__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Channel_Type__c')))?(String)requestvalues.get(queryMap.get('Channel_Type__c')):'';
+        obj.LeadSource__c=String.isNotBlank((String)requestvalues.get(queryMap.get('LeadSource__c')))?(String)requestvalues.get(queryMap.get('LeadSource__c')):'';
+        obj.Program_GoNoGoBRE__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Program_GoNoGoBRE__c')))?(String)requestvalues.get(queryMap.get('Program_GoNoGoBRE__c')):'';
+        obj.Card_Type__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Card_Type__c')))?(String)requestvalues.get(queryMap.get('Card_Type__c')):'';
+        obj.Salutation__c=(String)requestvalues.get(queryMap.get('Salutation__c'));
+        obj.First_Name__c=(String)requestvalues.get(queryMap.get('First_Name__c'));
+        obj.Middle_Name__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Middle_Name__c')))?(String)requestvalues.get(queryMap.get('Middle_Name__c')):'';
+        obj.Last_Name__c=(String)requestvalues.get(queryMap.get('Last_Name__c'));
+        //String dob = ((String)requestvalues.get(queryMap.get('DOB__c'))).remove('\\');
+        obj.DOB__c=Date.parse(((String)requestvalues.get(queryMap.get('DOB__c'))).remove('\\'));
+        obj.Gender__c=(String)requestvalues.get(queryMap.get('Gender__c'));
+        obj.PAN__c=(String)requestvalues.get(queryMap.get('PAN__c'));
+        obj.Email__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Email__c')))?(String)requestvalues.get(queryMap.get('Email__c')):'';
+        obj.Mobile_No__c=(String)requestvalues.get(queryMap.get('Mobile_No__c'));
+        obj.Residence_Address_Line_1__c=(String)requestvalues.get(queryMap.get('Residence_Address_Line_1__c'));
+        obj.Residence_Address_Line_2__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Residence_Address_Line_2__c')))?(String)requestvalues.get(queryMap.get('Residence_Address_Line_2__c')):'';
+        obj.Residence_Address_Line_3__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Residence_Address_Line_3__c')))?(String)requestvalues.get(queryMap.get('Residence_Address_Line_3__c')):'';
+        obj.Residence_Pincode__c=(String)requestvalues.get(queryMap.get('Residence_Pincode__c'));
+        obj.Residence_City__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Residence_City__c')))?(String)requestvalues.get(queryMap.get('Residence_City__c')):'';
+        obj.Residence_State__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Residence_State__c')))?(String)requestvalues.get(queryMap.get('Residence_State__c')):'';        
+        obj.Office_Address_Line_1__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_Address_Line_1__c')))?(String)requestvalues.get(queryMap.get('Office_Address_Line_1__c')):'';
+        obj.Office_Address_Line_2__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_Address_Line_2__c')))?(String)requestvalues.get(queryMap.get('Office_Address_Line_2__c')):'';
+        obj.Office_Address_Line_3__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_Address_Line_3__c')))?(String)requestvalues.get(queryMap.get('Office_Address_Line_3__c')):'';
+        obj.Office_Pincode__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_Pincode__c')))?(String)requestvalues.get(queryMap.get('Office_Pincode__c')):'';
+        obj.Office_City__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_City__c')))?(String)requestvalues.get(queryMap.get('Office_City__c')):'';
+        obj.Office_State__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_State__c')))?(String)requestvalues.get(queryMap.get('Office_State__c')):'';
+        obj.Office_Mobile__c=String.isNotBlank((String)requestvalues.get(queryMap.get('Office_Mobile__c')))?(String)requestvalues.get(queryMap.get('Office_Mobile__c')):'';
+        //obj.Employment_Type__c= getEmploymentType().get((String)requestvalues.get(queryMap.get('Employment_Type__c')));
+        obj.Employment_Type__c = getEmploymentType((String)requestvalues.get(queryMap.get('Employment_Type__c')));
+        String income;
+        income=String.isNotBlank((String)requestvalues.get(queryMap.get('Net_Monthly_Income__c')))?(String)requestvalues.get(queryMap.get('Net_Monthly_Income__c')):'0';
+        
+        obj.Net_Monthly_Income__c=Decimal.valueOf(income);
+        
+        String placeholder3Value;
+        //placeholder3Value=(String)responsevalues.get('Placeholder_3');
+        placeholder3Value=String.isNotBlank((String)responsevalues.get('Placeholder_3'))?(String)responsevalues.get('Placeholder_3'):'';
+        
+        String programGoNoGo;
+        programGoNoGo=String.isNotBlank((String)requestvalues.get(queryMap.get('Program_GoNoGoBRE__c')))?(String)requestvalues.get(queryMap.get('Program_GoNoGoBRE__c')):'';
+        
+        String decisionValue;
+        //decisionValue=(String)responsevalues.get('Decision');
+        decisionValue=String.isNotBlank((String)responsevalues.get('Decision'))?(String)responsevalues.get('Decision'):'';
+        obj.Disposition__c = 'BFL Application Initiated';
+        upsert obj;
+        
+        if( ! decisionValue.equalsIgnoreCase('D')){
+            // Decision A
+            
+            if(placeholder3Value.equalsIgnoreCase('FCU_REQUIRED|Y') ){
+                Id BFLFCURecordType = [SELECT Name, Id FROM RecordType where Name='BFL FCU Record' WITH SECURITY_ENFORCED LIMIT 1].Id;
+            	obj.RecordTypeId = BFLFCURecordType;
+                Group BFLFCUQueue = [select Id from Group where Type = 'Queue' AND DeveloperNAME =: 'BFL_FCU_Pending_queue'];
+                obj.OwnerId=BFLFCUQueue.Id;
+                //obj.BFL_FCU_Status__c='Pending';
+                obj.Disposition__c='BFL FCU Pending';
+                obj.BFL_FCU_In_Time__c=System.now();
+            }
+            if(placeholder3Value.equalsIgnoreCase('FCU_REQUIRED|N')){
+                if(programGoNoGo.equalsIgnoreCase('Underwriting')){
+                    Id BFLFCURecordType = [SELECT Name, Id FROM RecordType where Name='BFL FCU Record' WITH SECURITY_ENFORCED LIMIT 1].Id;
+                    obj.RecordTypeId = BFLFCURecordType;
+                    Group BFLFCUQueue = [select Id from Group where Type = 'Queue' AND DeveloperNAME =: 'BFL_FCU_Pending_queue'];
+                    obj.OwnerId=BFLFCUQueue.Id;
+                    //obj.BFL_FCU_Status__c='Pending';
+                    obj.Disposition__c='BFL FCU Pending';
+                    obj.BFL_FCU_In_Time__c=System.now();
+                }
+                else{
+                    Group BREProcessQueue = [select Id from Group where Type = 'Queue' AND DeveloperNAME =: 'BRE_Process_Queue'];
+                    obj.OwnerId=BREProcessQueue.Id;
+                    //obj.BFL_FCU_Status__c='Pending';
+                    obj.RecordTypeId = bflReportType;
+                    obj.Disposition__c='BFL Application Completed';
+                    obj.BFL_FCU_In_Time__c=System.now();
+                }
+                
+            }   
+        }
+        else{
+            // Decision D
+            
+            Group BRERejectQueue = [select Id from Group where Type = 'Queue' AND DeveloperNAME =: 'BRE_Reject_Queue'];
+            obj.OwnerId=BRERejectQueue.Id;
+            obj.Disposition__c = 'BFL Application Initiated';
+            obj.RecordTypeId = bflReportType;
+        }
+        
+        
+        obj.Integration_Status__c = 'App Creation API Initiated';
+        CC_Application_Data__c ccObj;
+        if(validateRequestData(obj)){
+            
+            
+            
+            //insert obj;
+            upsert obj;
+            
+            ccObj = [SELECT Id,Integration_Status__c,First_Name__c,Last_Name__c,Name,CreatedDate,Net_Monthly_Income__c,Application_Reference_number__c,Application_Serial_Number__c FROM CC_Application_Data__c where Id =:obj.Id  WITH SECURITY_ENFORCED LIMIT 1];
+            
+            if(ccObj.id != null){  
+                
+                ccObj.Application_Reference_number__c =  CommonUtil.getApplicationNumber('BFL','BFL',ccObj.Application_Serial_Number__c);
+                
+            }
+            
+        }
+        else{            
+            
+            responseWrapper.IsError='TRUE';
+            return null;
+        }
+        
+        listObj.add(ccObj);
+        return listObj;
+    }
+    
+    public static boolean validateRequestData(CC_Application_Data__c obj){                
+        
+        if(validateEmploymentType(obj)==false){
+            return false;
+        }
+        if(validateGender(obj)==false){
+            return false;
+        }
+        if(validatePAN(obj)==false){
+            return false;
+        }                  
+        if(validateDOB(obj)==false){
+            return false;
+        }
+        if(validateMobile(obj)==false){
+            return false;
+        }
+        if(validatePincode(obj)==false){
+            return false;
+        }
+        if(validateAddressLineOne(obj)==false){
+            return false;
+        }
+        if(validateSalutation(obj)==false){
+            return false;
+        }
+        if(validateFirstName(obj)==false){
+            return false;
+        }
+        if(validateLastName(obj)==false){
+            return false;
+        }
+        
+        return true;               
+    }
+    
+    
+    private static boolean validateEmploymentType(CC_Application_Data__c obj){
+        if(String.isBlank(obj.Employment_Type__c)){            
+            responseWrapper.ErrorMsg = 'Blank or invalid employment';
+            return false;
+        }
+        return true;
+    }
+    
+    static boolean validatePincode(CC_Application_Data__c obj){
+        if(String.isBlank(obj.Residence_Pincode__c) ||Integer.valueOf(obj.Residence_Pincode__c)<100001 || Integer.valueOf(obj.Residence_Pincode__c)>999999){            
+            responseWrapper.ErrorMsg = 'Invalid PINCODE';
+            return false;
+        }
+        List<Pincode__c> pincodeSourceableList = [SELECT City__c, Name, City_Unique_Code__c, State__c, Sourceable__c FROM Pincode__c WHERE Name=:obj.Residence_Pincode__c WITH SECURITY_ENFORCED];
+        if(pincodeSourceableList == null && pincodeSourceableList.size() <= 0 ){            
+            responseWrapper.ErrorMsg = 'Invalid PINCODE';
+            return false;
+        }
+        return true;
+    }
+    
+    static boolean validateSalutation(CC_Application_Data__c obj){
+        
+        if(obj.Salutation__c.equalsIgnoreCase('Mr.') || obj.Salutation__c.equalsIgnoreCase('Ms.') || obj.Salutation__c.equalsIgnoreCase('Mrs.') ||
+           obj.Salutation__c.equalsIgnoreCase('Dr.') || obj.Salutation__c.equalsIgnoreCase('Prof.')){            
+               return true;                    
+           }
+        else{
+            responseWrapper.ErrorMsg = 'Incorrect or blank Title';
+            return false;
+        }                  
+    }
+    
+    static boolean validateGender(CC_Application_Data__c obj){
+        
+        if(obj.Gender__c.equalsIgnoreCase('Female') || obj.Gender__c.equalsIgnoreCase('Male') || obj.Gender__c.equalsIgnoreCase('Third Gender')){            
+            return true;
+            
+        }
+        else{
+            responseWrapper.ErrorMsg = 'Incorrect or blank Gender';
+            return false;
+        }
+        
+        
+    }
+    private static boolean validatePAN(CC_Application_Data__c obj){
+        if(String.isBlank(obj.PAN__c)){            
+            responseWrapper.ErrorMsg = 'Blank PAN';
+            return false;
+        }else{
+            String panFormat = '[A-Z]{3}[P][A-Z]{1}[0-9]{4}[A-Z]{1}';
+            pattern myPattern = pattern.compile(panFormat);
+            matcher myMatcher = myPattern.matcher(obj.PAN__c);
+            if(!myMatcher.matches()){                
+                responseWrapper.ErrorMsg = 'Invalid PAN format';
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    static boolean validateDOB(CC_Application_Data__c obj){
+        if(obj.DOB__c ==null){            
+            responseWrapper.ErrorMsg = 'Blank DOB';
+            return false;
+        }
+        return true;
+    }
+    private static boolean validateMobile(CC_Application_Data__c obj){
+        if(String.isBlank(obj.Mobile_No__c)){            
+            responseWrapper.ErrorMsg = 'Blank Mobile No.';
+            return false;           
+        }
+        if(String.isNotBlank(obj.Mobile_No__c)){
+            String mobileFormat = '[6-9]{1}[0-9]{9}';
+            pattern myPattern = pattern.compile(mobileFormat);
+            matcher myMatcher = myPattern.matcher(obj.Mobile_No__c);
+            if(!myMatcher.matches()) {
+                
+                responseWrapper.ErrorMsg = 'Invalid Mobile No. format';
+                return false;
+            }
+        }
+        return true;
+    }
+    private static boolean validateAddressLineOne(CC_Application_Data__c obj){
+        if(String.isBlank(obj.Residence_Address_Line_1__c)){            
+            responseWrapper.ErrorMsg = 'Blank Residential Address';
+            return false;
+        }
+        return true;
+    }
+    private static boolean validateFirstName(CC_Application_Data__c obj){
+        String firstName = obj.First_Name__c;
+        if(String.isBlank(firstName)){            
+            responseWrapper.ErrorMsg = 'Blank First Name';
+            return false;
+        }
+        if(String.isNotBlank(firstName)){  
+            if(checkSpecialCharacter(firstName)){                
+                responseWrapper.ErrorMsg = 'Special characters not allowed in First Name';
+                return false;                
+            }         
+        }
+        return true;
+    }
+    
+    private static boolean validateLastName(CC_Application_Data__c obj){
+        String lastName = obj.Last_Name__c;
+        if(String.isBlank(lastName)){            
+            responseWrapper.ErrorMsg = 'Blank Last Name';
+            return false;
+        }
+        if(String.isNotBlank(lastName)){  
+            if(checkSpecialCharacter(lastName)){                
+                responseWrapper.ErrorMsg = 'Special characters not allowed in Last Name';
+                return false;                
+            }         
+        }
+        return true;
+    }
+    
+    private static boolean checkSpecialCharacter(String paramString)
+    {
+        boolean isSpecialChar = false;
+        //String specialCharFormat = '^[ A-Za-z0-9_,./#-]*$';
+        String specialCharFormat = '^[ A-Za-z0-9_,./#-]*$';
+        pattern myPattern = pattern.compile(specialCharFormat);
+        matcher myMatcher = myPattern.matcher(paramString);
+        if(!myMatcher.matches()){
+            isSpecialChar = true;
+        }
+        
+        return isSpecialChar;
+    }
+    
+    
+    private static String getEmploymentType(String emp){
+        String empType;
+        if(emp.equalsIgnoreCase('SAL')){
+            empType='Salaried';
+        }
+        else if(emp.equalsIgnoreCase('SEMP')){
+            empType='Self Employed';
+        }
+        else if(emp.equalsIgnoreCase('STUD') || emp.equalsIgnoreCase('STDN') || emp.equalsIgnoreCase('Student') || emp.equalsIgnoreCase('STD')){
+            empType='Student';
+        }
+        else{
+            empType='Other';
+        }
+        return empType;
+    }
+    
+    //Method to log the IntegrationLogger for Request and Response - only for happy logs
+    private static void commitIntegrationLogger(List<Integration_Logger__c> integrationloggerlist,Integration_Logger__c integrationLogger){
+        integrationLogger.Status__c = IntegrationConstants.INTEGRATION_LOGGER_SUCCESS;  
+        integrationLogger.Response__c = String.valueOf(responseWrapper);
+        integrationLogger.End_Time__c = System.now();
+        integrationloggerlist.add(integrationLogger); 
+        
+        Database.DMLOptions dml = new Database.DMLOptions();
+        dml.AllowFieldTruncation = true;
+        if(integrationloggerlist != null && integrationloggerlist.size() > 0){
+            Database.SaveResult[] srList = Database.insert(integrationloggerlist,dml);
+        } 
+        
+    }
+}
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+global without sharing class ECSReconAPI{
+    @future(Callout = true)
+    global static void getDetails(String appRefId){
+        List<Integration_Logger__c> integrationloggerlist = new List<Integration_Logger__c>();            
+        Integration_Logger__c integrationLogger = CommonUtil.integrationLogger(IntegrationConstants.INTEGRATION_LOGGER_SUCCESS); // need to check INTEGRATION_LOGGER_SUCCESS
+        integrationLogger.Start_Time__c = System.now();
+        Ecs_Matching_Score__c ecsObj = new Ecs_Matching_Score__c();
+        CC_Application_Data__c ccappData=new CC_Application_Data__c();
+        HttpResponse response;
+        String mockresponse;
+        DateTime startTime = System.now();
+        DateTime endTime = system.now();
+        Map<String,sObject> loggerMap = new Map<String,sObject>();   
+        List<sObject> logList = new List<sObject>();
+        String metdataName='ECSAPIRecon';
+        String appRefNumber;
+        String BFLUniqueId;
+        Integration__mdt callOutMetaData =[SELECT Id,isMock__c,RefCondition__c,MockResponse__c,JSONRequestBody__c FROM Integration__mdt WHERE DeveloperName =: 'ECSAPIRecon'];
+        String responseForMock = callOutMetaData.MockResponse__c;
+        IntegrationLogrWrapper.Integrationlogger logwrapper = new IntegrationLogrWrapper.Integrationlogger();
+        
+        if(appRefId != null){
+            ccappData = [SELECT Id,Application_Reference_number__c,ECS_Parameter_status__c,BRE_Recon_Status__c,BFLUniqueId__c,VCIP_Status__c,RAMP_Status__c,First_Name__c, Middle_Name__c, Last_Name__c,
+                         Disposition__c, DOB__c, Resident_Status__c, Residence_Address_Line_1__c, Residence_Address_Line_2__c,
+                         Residence_Address_Line_3__c, Residence_City__c, Residence_State__c, Residence_Pincode__c,
+                         Residence_Country__c, Mobile_No__c, Email__c, Identity_Document__c, Identity_Document_No__c,Fire_Ramp_Insta__c,
+                         Address_Proof_Document__c, Address_Proof_Document_No__c, PAN__c, PREFERENCE_FATCA_Tax_Identification_No__c,Program_GoNoGoBRE__c,UnderwriterStatus__c,
+                         Application_No__c, Action__c,RAMP_Batch_Count__c, Entity_Relationship_ID__c, Upsell_Remarks__c,
+                         SFDC_QC_Status__c,RBL_BFL_Status__c,Recon_API_Status__c,Underwriter_In_Time__c,BFL_FCU_Status__c,ownerId,RecordTypeId FROM CC_Application_Data__c
+                         WHERE Application_Reference_number__c =: appRefId limit 1]; 
+            
+            appRefNumber=ccappData.Application_Reference_number__c;
+            BFLUniqueId=ccappData.BFLUniqueId__c;
+        }
+        logWrapper.appref = appRefNumber;
+        logwrapper.startingTime=startTime;
+        logwrapper.mockResp =mockresponse;
+        logwrapper.logName = 'ECS Recon Logs'; 
+        logwrapper.ccappId=ccappData.id;
+        try{
+            if(ccappData.id != NULL){
+                String request = WebServiceLogin.requestGenerator(BFLUniqueId,metdataName); 
+                logwrapper.request = request;
+                if(callOutMetaData.isMock__c){
+                    response= new HttpResponse();
+                    response.setStatusCode(200);
+                    response.setBody(callOutMetaData.MockResponse__c);
+                }
+                else{  
+                    response=WebServiceLogin.performHTTPCallout(request, metdataName);
+                }
+                ccappData.integration_status__c='Integration of ECS Recon initiated successfully';
+                String responseBody = response.getBody();
+                if(response.getStatusCode() == 200 && String.isNotBlank(response.getBody()) ){
+                    ECSReconResponse ecsMatchResp = (ECSReconResponse) JSON.deserialize(responseBody, ECSReconResponse.class);
+                    if(ecsMatchResp !=null && (ecsMatchResp.err == null || ecsMatchResp.err == false)){
+                        onEcsReconSuccess (logwrapper, ecsObj, ecsMatchResp,response,ccappData,loggerMap,logList);                            
+                    }
+                    else{
+                        onEcsReconFailure (logwrapper,response,mockresponse, ccappData,loggerMap,logList);
+                    }
+                }
+            }
+        } Catch(Exception e) {
+            onEcsReconException (ccappData,logwrapper,appRefNumber,e);
+        }
+    }
+    Private static void onEcsReconSuccess (IntegrationLogrWrapper.Integrationlogger logwrapper,Ecs_Matching_Score__c ecsObj,ECSReconResponse ecsMatchResp,HttpResponse response,CC_Application_Data__c ccappData,Map<String,sObject> loggerMap,List<sObject> logList) {
+        String appRefId;
+        CC_Application_Data__c updateccData = new CC_Application_Data__c();
+        logwrapper.response=response;
+        logwrapper.mockResp = null;
+        logWrapper.appref =ccappData.Application_Reference_number__c;
+        logwrapper.ccappId=ccappData.id;
+        logwrapper.status='Success';
+        loggerMap = CommonUtil.logInfo(logwrapper);
+        logList.add(loggerMap.get('Integration_logger'));
+        ecsObj.CC_Application_Data__c=ccappData.id;
+        ecsObj.AddressMatchingScore__c = Decimal.valueOf(string.valueOf(ecsMatchResp.RblCC_Ecs.RequestBody.addressMatchingScore));
+        ecsObj.Authenticationcode__c = ecsMatchResp.RblCC_Ecs.RequestBody.authenticationcode; 
+        ecsObj.PanVsKycNameMatchingScore__c=Decimal.valueOf(string.valueOf(ecsMatchResp.RblCC_Ecs.RequestBody.panVsKycNameMatchingScore));
+        ecsObj.PanVsSfdcNameMatchingScore__c=Decimal.valueOf(string.valueOf(ecsMatchResp.RblCC_Ecs.RequestBody.panVsSfdcNameMatchingScore));
+        ecsObj.PhotoMatchingScore__c=Decimal.valueOf(string.valueOf(ecsMatchResp.RblCC_Ecs.RequestBody.photoMatchingScore));
+        ecsObj.Rrn__c=ecsMatchResp.RblCC_Ecs.RequestBody.rrn;
+        ecsObj.SfdcVsKycNameMatchingScore__c=Decimal.valueOf(string.valueOf(ecsMatchResp.RblCC_Ecs.RequestBody.sfdcVsKycNameMatchingScore));
+        ecsObj.Txnid__c=ecsMatchResp.RblCC_Ecs.RequestBody.txnid;
+        ecsObj.Uniquerequestid__c=ecsMatchResp.RblCC_Ecs.RequestBody.uniquerequestid;
+        ecsObj.Name='ECS Record- ' + Datetime.now().format();   
+        ecsObj.isRecon__c=true; 
+        if(ecsObj.PhotoMatchingScore__c>=decimal.valueOf(system.label.photoMatchingScore) && 
+           ecsObj.PanVsSfdcNameMatchingScore__c>=decimal.valueOf(system.label.PanVsSfdcNameMatchingScore) && 
+           ecsObj.PanVsKycNameMatchingScore__c>=decimal.valueOf(system.label.PanVsKycNameMatchingScore)){
+            ccappData.SFDC_QC_Status__c='Auto QC';
+        }
+        
+        else{
+            ccappData.SFDC_QC_Status__c='Manual QC';
+        }
+        if (Schema.sObjectType.CC_Application_Data__c.isUpdateable()) {
+            update ccappData;
+        }
+        insert ecsObj;
+        insert logList;
+        updateccData = [SELECT Id,Application_Reference_number__c,Integration_Status__c FROM CC_Application_Data__c WHERE Application_Reference_number__c =: ccappData.Application_Reference_number__c limit 1];
+        if(updateccData != null){
+            ccappData.integration_status__c='ECS Recon Integration executed successfully.';
+            update ccappData;
+        }
+        
+    }
+    Private static void onEcsReconFailure (IntegrationLogrWrapper.Integrationlogger logwrapper,HttpResponse response,string mockresponse,CC_Application_Data__c ccappData,Map<String,sObject> loggerMap,List<sObject> logList) {
+        Map<String,String> mapQueue = new Map<String,String>();
+        List<Group> queue = [select Id,DeveloperNAME from Group where Type = 'Queue'];
+        for(Group queueData:queue){
+            mapQueue.put(queueData.DeveloperNAME,queueData.Id);
+        } 
+        if(ccappData != null){
+            List<BFLTrggerClass.platformEventWarapper> platWrapList = new  List<BFLTrggerClass.platformEventWarapper>();  
+            List<CC_Application_Data__c> ccDataList=new List<CC_Application_Data__c>();
+            BFLFinalPushAPI.EcsParamsWrapper ecsParam = (BFLFinalPushAPI.EcsParamsWrapper)JSON.deserialize(ccappData.ECS_Parameter_status__c, BFLFinalPushAPI.EcsParamsWrapper.class);
+            String qcDecision=BFLFinalPushAPIHelper.EcsMatchScore(ecsParam.addressMatch,ecsParam.nameMatch,ecsParam.panMatch,ecsParam.photoMatch);
+            ccappData.SFDC_QC_Status__c =qcDecision;
+            ccDataList.add(ccappData);
+            if(qcDecision =='Manual QC' && ccappData.RBL_BFL_Status__c == 'Auto QC'){
+                ccappData.Action__c = 'Application Moved to BFL QC Reject Queue'; 
+                ccappData.Disposition__c='BFL QC Reject queue';
+                update ccappData;
+            }else{
+                IntegrationConstants.isRAMP_context = true;
+                BFLTrggerClass.platformEventWarapper platWrap = new  BFLTrggerClass.platformEventWarapper();
+                platWrap.applicationRefNo = ccappData.Application_Reference_number__c;
+                platWrap.isInstaCard = true;
+                platWrap.typeOfAPI = 'QC';
+                platWrap.statusShareReason = 'Auto QC Approved';
+                platWrap.BFLUniqId =ccappData.BFLUniqueId__c;
+                platWrapList.add(platWrap); 
+                List<String> statusShareList = new List<String>();    
+                if(platWrapList.size() > 0){
+                    for(BFLTrggerClass.platformEventWarapper status: platWrapList){
+                        String share = JSON.serialize(status);
+                        statusShareList.add(share);
+                    }
+                }
+                if(statusShareList.size()>0){
+                    StatusShareAPI.shareStatus(statusShareList);
+                } 
+                Id UWReportType = [SELECT Name, Id FROM RecordType where Name='BFL Underwriter Record Type' WITH SECURITY_ENFORCED LIMIT 1].Id;
+                if((ccappData.BFL_FCU_Status__c != null && (ccappData.BFL_FCU_Status__c == 'Screened' || ccappData.BFL_FCU_Status__c == 'Refer'))){
+                    ccappData.RecordTypeId=UWReportType;
+                    if(mapQueue.size() > 0){
+                        ccappData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                    }
+                    ccappData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                    ccappData.UnderwriterStatus__c = 'Pending';
+                    ccappData.Disposition__c = 'Underwriter Pending'; 
+                    ccappData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                }else{
+                    if(ccappData.Program_GoNoGoBRE__c != 'Underwriting'){
+                        
+                        IntegrationConstants.isRAMP_context = true;
+                        ccappData.Fire_Ramp_Insta__c = true;
+                        
+                    }else{ 
+                        ccappData.RecordTypeId=UWReportType;
+                        if(mapQueue.size() > 0){
+                            ccappData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                        }
+                        ccappData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                        ccappData.UnderwriterStatus__c = 'Pending';
+                        ccappData.Disposition__c = 'Underwriter Pending'; 
+                        ccappData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                        
+                    }
+                }
+                
+                update ccappData;
+            }
+            mockresponse=null;   
+            logwrapper.response=response;
+            logwrapper.mockResp =mockresponse;
+            loggerMap = CommonUtil.logInfo(logwrapper);
+            logList.add(loggerMap.get('Integration_logger'));
+            
+            ccappData.integration_status__c='Invalid Request Id' ;
+            update ccappData;
+            insert logList;
+        }
+    }
+    private static void onEcsReconException (CC_Application_Data__c ccappData,IntegrationLogrWrapper.Integrationlogger logwrapper,string appRefNumber,Exception e) {
+        Map<String,String> mapQueue = new Map<String,String>();
+        List<Group> queue = [select Id,DeveloperNAME from Group where Type = 'Queue'];
+        for(Group queueData:queue){
+            mapQueue.put(queueData.DeveloperNAME,queueData.Id);
+        }
+        String errorMsg;   
+        Integer errorLine;
+        DateTime startTime = System.now();
+        List<sObject> errorlogList = new List<sObject>();
+        List<CC_Application_Data__c> ccDataList= new List<CC_Application_Data__c>();
+        Map<String, sObject> ErrorLogMap=new Map<String, sObject>();
+        List<BFLTrggerClass.platformEventWarapper> platWrapList = new  List<BFLTrggerClass.platformEventWarapper>();
+        IntegrationLogrWrapper.IntegrationErrorlog errorlogWrap = new IntegrationLogrWrapper.IntegrationErrorlog();
+        errorlogWrap.appref=appRefNumber;
+        errorlogWrap.ErrorMsg = e.getStackTraceString();
+        errorlogWrap.errorTime=startTime;
+        errorlogWrap.lineNum=e.getLineNumber();
+        errorlogWrap.message=e.getMessage();
+        errorlogWrap.ccappId=ccappData.id;
+        errorlogWrap.logName='ECS Matching Error Log'; 
+        ErrorLogMap = CommonUtil.logErrorInfo(errorlogWrap);
+        errorlogList.add(ErrorLogMap.get('IntegrationErrorLog'));
+        BFLFinalPushAPI.EcsParamsWrapper ecsParam = (BFLFinalPushAPI.EcsParamsWrapper)JSON.deserialize(ccappData.ECS_Parameter_status__c, BFLFinalPushAPI.EcsParamsWrapper.class);
+        String qcDecision=BFLFinalPushAPIHelper.EcsMatchScore(ecsParam.addressMatch,ecsParam.nameMatch,ecsParam.panMatch,ecsParam.photoMatch);
+        ccappData.SFDC_QC_Status__c =qcDecision;
+        ccDataList.add(ccappData);
+        if(qcDecision =='Manual QC' && ccappData.RBL_BFL_Status__c == 'Auto QC'){
+            ccappData.Integration_Status__c = 'Integration of ECS Recon initiated successfully';
+            ccappData.Action__c = 'Application Moved to BFL QC Reject Queue'; 
+            ccappData.Disposition__c='BFL QC Reject queue';
+            update ccappData;
+            ccappData.Integration_Status__c = 'ECS Recon Integration Failed  '+e.getMessage();
+            update ccappData;
+        }else{
+            BFLTrggerClass.platformEventWarapper platWrap = new  BFLTrggerClass.platformEventWarapper();
+            platWrap.applicationRefNo = ccappData.Application_Reference_number__c;
+            platWrap.isInstaCard = true;
+            platWrap.typeOfAPI = 'QC';
+            platWrap.statusShareReason = 'Auto QC Approved';
+            platWrap.BFLUniqId =ccappData.BFLUniqueId__c;
+            platWrapList.add(platWrap); 
+            
+            List<String> statusShareList = new List<String>();    
+            if(platWrapList.size() > 0){
+                for(BFLTrggerClass.platformEventWarapper status: platWrapList){
+                    String share = JSON.serialize(status);
+                    statusShareList.add(share);
+                }
+            }
+            
+            if(statusShareList.size()>0){
+                StatusShareAPI.shareStatus(statusShareList);
+                
+            } 
+            ccappData.Integration_Status__c = 'Integration of ECS Recon initiated successfully';
+            update ccappData;   
+            Id UWReportType = [SELECT Name, Id FROM RecordType where Name='BFL Underwriter Record Type' WITH SECURITY_ENFORCED LIMIT 1].Id;
+            if((ccappData.BFL_FCU_Status__c != null && (ccappData.BFL_FCU_Status__c == 'Screened' || ccappData.BFL_FCU_Status__c == 'Refer'))){ 
+                ccappData.RecordTypeId=UWReportType;
+                if(mapQueue.size() > 0){
+                    ccappData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                }
+                ccappData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                ccappData.UnderwriterStatus__c = 'Pending';
+                ccappData.Disposition__c = 'Underwriter Pending'; 
+                ccappData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+            }else{
+                if(ccappData.Program_GoNoGoBRE__c != 'Underwriting'){
+                    
+                    IntegrationConstants.isRAMP_context = true;
+                    ccappData.Fire_Ramp_Insta__c = true;
+                    
+                }else{
+                    ccappData.RecordTypeId=UWReportType;
+                    if(mapQueue.size() > 0){
+                        ccappData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                    }
+                    ccappData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                    ccappData.UnderwriterStatus__c = 'Pending';
+                    ccappData.Disposition__c = 'Underwriter Pending'; 
+                    ccappData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                    
+                }
+            }
+            ccappData.Integration_Status__c = 'ECS Recon Integration Failed  '+e.getMessage();             
+            update ccappData;
+            
+        }
+        insert errorlogList;
+        
+    }
+    
+}
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+public without sharing class ThinkAnalyticsReconAPI {
+    
+    @future(Callout = true)
+    public static void getDetails(String appRefId){
+        CC_Application_Data__c ccData = new CC_Application_Data__c();
+        List<CC_Application_Data__c> ccList=new List<CC_Application_Data__c>();
+        String token;
+        HttpResponse res;
+        HttpResponse resFromThinkAnalyticsAPI;
+        String request;
+        String responseForMock;
+        String mockresponse;
+        Integer statusCode;
+        DateTime startTime = System.now();
+        DateTime endTime = system.now();
+        String startime ;
+        String errorMsg;
+        Integer errorLine;
+        String message;
+        String taQCValue = '';
+        Map<String,sObject> loggerMap = new Map<String,sObject>();
+        List<sObject> logList = new List<sObject>();
+        String metdataName='ThinkAnalyticsAPI';
+        ThinkAnalyticsAPIResponse response;
+        
+        List<Integration__mdt> igm = new List<Integration__mdt>([SELECT Id,isMock__c,RefCondition__c,MockResponse__c,JSONRequestBody__c FROM Integration__mdt WHERE DeveloperName =: 'ThinkAnalyticsAPI']);
+        responseForMock = igm[0].MockResponse__c;
+        Map<String, sObject> errorLogMap=new Map<String, sObject>();
+        List<sObject> errorlogList = new List<sObject>();
+        IntegrationLogrWrapper.Integrationlogger logwrapper = new IntegrationLogrWrapper.Integrationlogger();
+        List<Think_Analytics__c> thinkRecord;
+        CC_Application_Data__c updateccData = new CC_Application_Data__c();
+        List<Group> queue = [select Id,DeveloperNAME from Group where Type = 'Queue'];
+        Map<String,String> mapQueue = new Map<String,String>();
+        for(Group queueData:queue){
+            mapQueue.put(queueData.DeveloperNAME,queueData.Id);
+        }
+        logwrapper.startingTime=startTime;
+        logwrapper.mockResp =mockresponse;
+        logwrapper.logName = 'Think Analytics Recon logs';
+        
+        if(appRefId != null){
+            ccData = [SELECT Id,Application_Reference_number__c,Recon_API_Status__c,BRE_Recon_Status__c,BFLUniqueId__c,VCIP_Status__c,RAMP_Status__c,First_Name__c, Middle_Name__c, Last_Name__c,
+                      Disposition__c, DOB__c, Resident_Status__c, Residence_Address_Line_1__c, Residence_Address_Line_2__c,
+                      Residence_Address_Line_3__c, Residence_City__c, Residence_State__c, Residence_Pincode__c,
+                      Residence_Country__c, Mobile_No__c, Email__c, Identity_Document__c, Identity_Document_No__c,
+                      Address_Proof_Document__c, Address_Proof_Document_No__c, PAN__c, PREFERENCE_FATCA_Tax_Identification_No__c,Fire_Ramp_Insta__c,
+                      Application_No__c, Action__c,RAMP_Batch_Count__c,Underwriter_In_Time__c, Entity_Relationship_ID__c, Upsell_Remarks__c,SFDC_QC_Status__c,
+                      RBL_BFL_Status__c,Program_GoNoGoBRE__c,BFL_FCU_Status__c,ownerId,RecordTypeId FROM CC_Application_Data__c
+                      WHERE Application_Reference_number__c =: appRefId limit 1];
+            
+            
+        }
+        
+        try{
+            if(ccData != null){
+                if(string.isNotBlank(ccData.BFLUniqueId__c)){
+                    request=WebServiceLogin.requestGenerator(ccData.BFLUniqueId__c, metdataName);
+                    logwrapper.request = request;
+                    if(igm[0].isMock__c){
+                        resFromThinkAnalyticsAPI= new HttpResponse();
+                        logwrapper.response=null;
+                        logwrapper.mockResp =responseForMock;
+                        resFromThinkAnalyticsAPI.setStatusCode(200);
+                        resFromThinkAnalyticsAPI.setBody(igm[0].MockResponse__c);
+                    } else{
+                        resFromThinkAnalyticsAPI= new HttpResponse();
+                        resFromThinkAnalyticsAPI=WebServiceLogin.performHTTPCallout(request, metdataName);
+                    }
+                    if(resFromThinkAnalyticsAPI.getStatusCode()==200){
+                        if(ccData !=null){
+                            response =(ThinkAnalyticsAPIResponse) JSON.deserialize(resFromThinkAnalyticsAPI.getBody(), ThinkAnalyticsAPIResponse.class);
+                            mockresponse=null;
+                            logwrapper.response=resFromThinkAnalyticsAPI;
+                            logwrapper.mockResp =mockresponse;
+                            logWrapper.appref =ccData.Application_Reference_number__c;
+                            logwrapper.ccappId=ccData.id;
+                            logwrapper.status='Success';
+                            
+                            ccData.Integration_Status__c = 'Integration Think Analytics Recon initiated successfully';
+                            loggerMap = CommonUtil.logInfo(logwrapper);
+                            logList.add(loggerMap.get('Integration_logger'));
+                            
+                            Think_Analytics__c thinkObj=new Think_Analytics__c();
+                            thinkObj.Application_Reference_Number__c=ccData.Application_Reference_Number__c;
+                            thinkObj.BFLUniqueId__c=response.customerId;
+                            thinkObj.VCIP_Status__c=response.vcipStatus;
+                            thinkObj.CC_Application_Data__c=ccData.id;
+                            thinkObj.Name='Think Analytics from BFL-'+Datetime.now().format();
+                            thinkObj.isRecon__c=true;
+                            taQCValue = thinkObj.VCIP_Status__c;
+                            if(thinkObj.VCIP_Status__c=='VCIP_APPROVED'){
+                                ccData.SFDC_QC_Status__c='Auto QC';
+                                ccData.VCIP_Status__c='VCIP_APPROVED';
+                            } else if(thinkObj.VCIP_Status__c=='VCIP_REJECTED'){
+                                ccData.SFDC_QC_Status__c='Manual QC';
+                                ccData.VCIP_Status__c='VCIP_REJECTED';
+                                
+                            } else if(thinkObj.VCIP_Status__c=='Checker Pending'){
+                                ccData.SFDC_QC_Status__c='Manual QC';
+                                ccData.VCIP_Status__c='Checker Pending';
+                            }
+                            else if(taQCValue.equalsIgnoreCase('None') || taQCValue == ''){
+                                ccData.SFDC_QC_Status__c = 'Auto QC';
+                                ccData.VCIP_Status__c = null;
+                            }
+                            if (Schema.sObjectType.CC_Application_Data__c.isUpdateable()) {
+                                update ccData;
+                            }
+                            
+                            insert thinkObj;
+                            insert logList;
+                            updateccData = [SELECT Id,Application_Reference_number__c,Integration_Status__c FROM CC_Application_Data__c WHERE Application_Reference_number__c =: appRefId limit 1];
+                            if(updateccData != null){
+                                updateccData.Integration_Status__c = 'Integration Think Analytics Recon Executed successfully.';
+                                update updateccData;
+                            }
+                            // OperationsAPICalloutUtility.performEventForIntegrationStatus('Integration Think Analytics Recon Executed successfully.',ccData.id);
+                            
+                        }
+                    }
+                    
+                    else if(resFromThinkAnalyticsAPI.getStatusCode() != 200){
+                        if(ccData != null){
+                            APIProcessor app1 = new APIProcessor();
+                            app1.ccApplicationDataId = ccData.id;
+                            
+                            if(ccData.VCIP_Status__c=='VCIP_APPROVED'){
+                                ccData.SFDC_QC_Status__c ='Auto QC';
+                            }else{
+                                ccData.SFDC_QC_Status__c ='Manual QC';
+                            }
+                            
+                            
+                            
+                            List<BFLTrggerClass.platformEventWarapper> platWrapList = new  List<BFLTrggerClass.platformEventWarapper>();  
+                            
+                            IntegrationConstants.isRAMP_context = true;
+                            // ccData.Fire_Ramp_Insta__c = true;
+                            
+                            BFLTrggerClass.platformEventWarapper platWrap = new  BFLTrggerClass.platformEventWarapper();
+                            platWrap.applicationRefNo = ccData.Application_Reference_number__c;
+                            platWrap.isInstaCard = true;
+                            platWrap.typeOfAPI = 'QC';
+                            platWrap.statusShareReason = 'Auto QC Approved';
+                            platWrap.BFLUniqId =ccData.BFLUniqueId__c;
+                            platWrapList.add(platWrap); 
+                            
+                            List<String> statusShareList = new List<String>();     
+                            if(platWrapList.size() > 0){
+                                for(BFLTrggerClass.platformEventWarapper status: platWrapList){
+                                    String share = JSON.serialize(status);
+                                    statusShareList.add(share);
+                                }
+                            }
+                            
+                            if(statusShareList.size()>0){
+                                StatusShareAPI.shareStatus(statusShareList);
+                                
+                            }
+                            
+                            ccData.Integration_Status__c = 'Integration Think Analytics Recon initiated successfully';
+                            update ccData;
+                            ccData.Integration_Status__c = 'Think Analytics Recon Integration Failed due to status code';
+                            Id UWReportType = [SELECT Name, Id FROM RecordType where Name='BFL Underwriter Record Type' WITH SECURITY_ENFORCED LIMIT 1].Id;    
+                            if((ccData.BFL_FCU_Status__c != null && (ccData.BFL_FCU_Status__c == 'Screened' || ccData.BFL_FCU_Status__c == 'Refer'))){
+                                ccData.RecordTypeId=UWReportType;
+                                if(mapQueue.size() > 0){
+                                    ccData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                                }
+                                ccData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                                ccData.UnderwriterStatus__c = 'Pending';
+                                ccData.Disposition__c = 'Underwriter Pending'; 
+                                ccData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                            }else{
+                                if(ccData.Program_GoNoGoBRE__c != 'Underwriting'){
+                                    
+                                    IntegrationConstants.isRAMP_context = true;
+                                    ccData.Fire_Ramp_Insta__c = true;
+                                    
+                                }else{
+                                    if(mapQueue.size() > 0){
+                                        ccData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                                    }
+                                    ccData.RecordTypeId=UWReportType;
+                                    ccData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                                    ccData.UnderwriterStatus__c = 'Pending';
+                                    ccData.Disposition__c = 'Underwriter Pending'; 
+                                    ccData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                                    
+                                }
+                            }
+                            update ccData;
+                            ccList.add(ccData);
+                            mockresponse=null;
+                            logwrapper.response=resFromThinkAnalyticsAPI;
+                            logwrapper.mockResp =mockresponse;
+                            loggerMap = CommonUtil.logInfo(logwrapper);
+                            logList.add(loggerMap.get('Integration_logger'));
+                            insert logList;
+                            
+                        }
+                        
+                    }
+                }
+            }
+            
+        }Catch(Exception e){
+            
+            errorMsg=e.getStackTraceString();
+            errorLine= e.getLineNumber();
+            message=e.getMessage();
+            IntegrationLogrWrapper.IntegrationErrorlog errorlogWrap = new IntegrationLogrWrapper.IntegrationErrorlog();
+            errorlogWrap.ccappId=ccData.Id;
+            errorlogWrap.ErrorMsg = e.getStackTraceString();
+            errorlogWrap.errorTime=startTime;
+            errorlogWrap.lineNum=e.getLineNumber();
+            errorlogWrap.message=e.getMessage();
+            If(ccData != null){
+                if(ccData.VCIP_Status__c=='VCIP_APPROVED'){
+                    ccData.SFDC_QC_Status__c ='Auto QC';
+                }else{
+                    ccData.SFDC_QC_Status__c ='Manual QC';
+                }
+                List<BFLTrggerClass.platformEventWarapper> platWrapList = new  List<BFLTrggerClass.platformEventWarapper>();  
+                
+                // ccData.Fire_Ramp_Insta__c = true;  
+                BFLTrggerClass.platformEventWarapper platWrap = new  BFLTrggerClass.platformEventWarapper();
+                platWrap.applicationRefNo = ccData.Application_Reference_number__c;
+                platWrap.isInstaCard = true;
+                platWrap.typeOfAPI = 'QC';
+                platWrap.statusShareReason = 'Auto QC Approved';
+                platWrap.BFLUniqId =ccData.BFLUniqueId__c;
+                platWrapList.add(platWrap); 
+                
+                List<String> statusShareList = new List<String>();    
+                if(platWrapList.size() > 0){
+                    for(BFLTrggerClass.platformEventWarapper status: platWrapList){
+                        String share = JSON.serialize(status);
+                        statusShareList.add(share);
+                    }
+                }
+                
+                if(statusShareList.size()>0){
+                    StatusShareAPI.shareStatus(statusShareList);
+                    
+                } 
+                ccData.Integration_Status__c = 'Integration Think Analytics Recon initiated successfully';
+                update ccData;   
+                
+                ccData.Integration_Status__c = 'Think Analytics Recon Integration Failed  '+e.getMessage();
+                Id UWReportType = [SELECT Name, Id FROM RecordType where Name='BFL Underwriter Record Type' WITH SECURITY_ENFORCED LIMIT 1].Id;
+                
+                if((ccData.BFL_FCU_Status__c != null && (ccData.BFL_FCU_Status__c == 'Screened' || ccData.BFL_FCU_Status__c == 'Refer'))){
+                    ccData.RecordTypeId=UWReportType;
+                    if(mapQueue.size() > 0){
+                        ccData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                    }
+                    ccData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                    ccData.UnderwriterStatus__c = 'Pending';
+                    ccData.Disposition__c = 'Underwriter Pending'; 
+                    ccData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                }else{
+                    if(ccData.Program_GoNoGoBRE__c != 'Underwriting'){
+                        
+                        IntegrationConstants.isRAMP_context = true;
+                        ccData.Fire_Ramp_Insta__c = true;
+                        
+                    }else{
+                        if(mapQueue.size() > 0){
+                            ccData.ownerId = mapQueue.get('BFL_Credit_Process_Queue');
+                        }
+                        ccData.RecordTypeId=UWReportType;
+                        ccData.Action__c = 'Application Moved to BFL Credit Process queue'; 
+                        ccData.UnderwriterStatus__c = 'Pending';
+                        ccData.Disposition__c = 'Underwriter Pending'; 
+                        ccData.Underwriter_In_Time__c = DateTime.valueOf(DateTime.Now().format('yyyy-MM-dd HH:mm:ss.SSS'));
+                        
+                    }
+                }
+                
+                List<CC_Application_Data__c> ccApplicationList = new List<CC_Application_Data__c>();
+                
+                update ccData;
+            }
+            errorlogWrap.logName='Think Analytics Recon Error logs';
+            errorLogMap = CommonUtil.logErrorInfo(errorlogWrap);
+            errorlogList.add(errorLogMap.get('IntegrationErrorLog'));
+            insert errorlogList;
+            
+        }
+        
+        
+    }
+    
+    
+}
+..........................................................................................................................................................
+
+/**********************************************************************
+Name:  ThinkAnalyticsWebservice
+======================================================
+Purpose: Creation of Think Analytics record, Updating existing Think Analytics and CC Application record 
+======================================================
+
+***********************************************************************/
+
+@RestResource(urlMapping='/ThinkAnalyticsWebservice/')
+global without sharing class ThinkAnalyticsWebservice {
+    
+    public static ThinkAnalyticsWebserviceResGen apiResponse;
+    //public static Map<String, sObject> errorLogMap=new Map<String, sObject>();
+    //public static List<sObject> ErrorlogList = new List<sObject>();
+    public static boolean isRecordPresent=true;
+    public static String taVCIPStatusforReturnMethod='';
+    public static boolean isInsert=true;
+    public static boolean onlyTAData=true;
+    public static boolean isInsertBRENull=false;
+    @HttpPost                         
+    global static ThinkAnalyticsWebserviceResGen updateCCApp()
+    { 
+        
+        List<Integration_Logger__c> integrationloggerlist = new List<Integration_Logger__c>();            
+        Integration_Logger__c integrationLogger = CommonUtil.integrationLogger('Think Analytics API'); 
+        integrationLogger.Start_Time__c = System.now();
+        Map<String, sObject> errorLogMap=new Map<String, sObject>();
+        List<sObject> ErrorlogList = new List<sObject>();
+        DateTime startTime = System.now();
+        CC_Application_Data__c ccObj= new CC_Application_Data__c();
+        CC_Application_Data__c ccObjNew = new CC_Application_Data__c();
+        apiResponse = NEW ThinkAnalyticsWebserviceResGen();
+        String taVCIPStatus='';
+        //boolean isInsert=true;
+        
+        try{
+            ThinkAnalyticsWebserviceReqGen request=(ThinkAnalyticsWebserviceReqGen) JSON.deserialize(RestContext.request.requestBody.tostring(), ThinkAnalyticsWebserviceReqGen.class);
+            integrationLogger.Request__c = String.valueOf(request);
+            
+            Boolean validationFlag = checkParameterValidations(request);
+            if(validationFlag){
+                List<CC_Application_Data__c>  ccappList =  [SELECT Id,Application_Reference_number__c,Name, BFLUniqueId__c,SFDC_QC_Status__c,RBL_BFL_Status__c,Program_GoNoGoBRE__c FROM CC_Application_Data__c
+                                                            WHERE BFLUniqueId__c =:request.customerId limit 1];
+                                
+                if(ccappList.size()>0){ 
+                    
+                    if(String.isNotBlank(ccappList[0].RBL_BFL_Status__c)){
+                        integrationLogger.CC_App_Data__c =ccappList[0].Id;                                    
+                        integrationLogger.Application_No__c =ccappList[0].Application_Reference_number__c;
+                        commitIntegrationLogger(integrationloggerlist,integrationLogger);
+                        isRecordPresent=false;
+                        apiResponse=ThinkAnalyticsWebservice.returnResponse(request);
+                        return apiResponse;
+                    }
+                    
+                    Think_Analytics__c think = new Think_Analytics__c();
+                    
+                    think.Application_Reference_Number__c=ccappList[0].Application_Reference_Number__c;
+                    think.BFLUniqueId__c=request.customerId;
+                    think.VCIP_Status__c=request.vcipStatus;
+                    taVCIPStatus=request.vcipStatus;
+                    
+                    think.Name='Think Analytics from BFL-'+Datetime.now().format();
+                    List<BRE_Response__c> breList = [select id,name,CC_Application_Data__r.BFLUniqueId__c
+                                                     from BRE_Response__c where
+                                                     CC_Application_Data__r.BFLUniqueId__c =: request.customerId ];
+                    
+                    if(breList.size()>0){
+                        ccappList[0].Integration_Status__c='Think Analytics Integration initiated successfully';
+                        update ccappList;
+                        think.CC_Application_Data__c=ccappList[0].id;
+                        if(think.VCIP_Status__c=='VCIP_APPROVED'){
+                            ccappList[0].SFDC_QC_Status__c='Auto QC';
+                            ccappList[0].VCIP_Status__c='VCIP_APPROVED';
+                            ccappList[0].Integration_Status__c='Think Analytics Integration executed successfully';
+                        }
+                        else if(think.VCIP_Status__c=='VCIP_REJECTED'){
+                            ccappList[0].SFDC_QC_Status__c='Manual QC';
+                            ccappList[0].VCIP_Status__c='VCIP_REJECTED';
+                            ccappList[0].Integration_Status__c='Think Analytics Integration executed successfully';
+                        }
+                        else if(think.VCIP_Status__c=='Checker Pending'){
+                            ccappList[0].SFDC_QC_Status__c='Manual QC';
+                            ccappList[0].VCIP_Status__c='Checker Pending';
+                            ccappList[0].Integration_Status__c='Think Analytics Integration executed successfully';
+                        }
+                        else if(!(taVCIPStatus.equalsIgnoreCase('Checker Pending') ||taVCIPStatus.equalsIgnoreCase('VCIP_APPROVED')|| taVCIPStatus.equalsIgnoreCase('VCIP_REJECTED'))){
+                                
+                            	isInsert=false;
+                            	
+                            }
+                        update ccappList; 
+                    }
+                    else{
+                        
+                        // Calling BRE Recon API
+                        
+                        
+                        ccObj=BFLBREReconAPI.getBREResponse(ccappList[0],true);
+                        ccappList[0].Integration_Status__c='Think Analytics Integration initiated successfully';
+                        update ccappList;
+                        if(ccObj != null){
+                            
+                            think.CC_Application_Data__c=ccObj.id;
+                           
+                            if(think.VCIP_Status__c=='VCIP_APPROVED'){
+                                ccObj.SFDC_QC_Status__c='Auto QC';
+                                ccObj.VCIP_Status__c='VCIP_APPROVED';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                            }
+                            else if(think.VCIP_Status__c=='VCIP_REJECTED'){
+                                ccObj.SFDC_QC_Status__c='Manual QC';
+                                ccObj.VCIP_Status__c='VCIP_REJECTED';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                                
+                            }
+                            else if(think.VCIP_Status__c=='Checker Pending'){
+                                ccObj.SFDC_QC_Status__c='Manual QC';
+                                ccObj.VCIP_Status__c='Checker Pending';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                                
+                            }
+                            else if(!(taVCIPStatus.equalsIgnoreCase('Checker Pending') ||taVCIPStatus.equalsIgnoreCase('VCIP_APPROVED')|| taVCIPStatus.equalsIgnoreCase('VCIP_REJECTED'))){
+                                
+                                 isInsert=false;
+                               
+                                
+                            }
+                            
+                            update ccObj;
+                        }
+                    } 
+                    
+                    if(isInsert &&(taVCIPStatus.equalsIgnoreCase('Checker Pending') ||taVCIPStatus.equalsIgnoreCase('VCIP_APPROVED')|| taVCIPStatus.equalsIgnoreCase('VCIP_REJECTED'))){
+                        
+                        think.CC_Application_Data__c=ccappList[0].id;
+                        insert think;
+                    }
+                    
+                    
+                    //update ccappList;                                    
+                    integrationLogger.CC_App_Data__c =ccappList[0].Id;                                    
+                    integrationLogger.Application_No__c =ccappList[0].Application_Reference_number__c;
+                    
+                    apiResponse=ThinkAnalyticsWebservice.returnResponse(request);
+                    
+                }
+                else{
+                    //ccObjNew= new CC_Application_Data__c();
+                    ccObjNew.BFLUniqueId__c=request.customerId;
+                    
+                    ccObj=BFLBREReconAPI.getBREResponse(ccObjNew,true);
+                    
+                    if(ccObj != NULL){
+                        update ccObj;
+                        Think_Analytics__c think = new Think_Analytics__c();
+                        think.BFLUniqueId__c=request.customerId;
+                        think.VCIP_Status__c=request.vcipStatus;
+                        think.Name='Think Analytics from BFL-'+Datetime.now().format();
+                        think.CC_Application_Data__c=ccObj.Id;
+                        
+                        if(ccObj.BRE_Reject__c!='Reject'){
+                            if(think.VCIP_Status__c=='VCIP_APPROVED'){
+                                ccObj.SFDC_QC_Status__c='Auto QC';
+                                ccObj.VCIP_Status__c='VCIP_APPROVED';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                            }
+                            else if(think.VCIP_Status__c=='VCIP_REJECTED'){
+                                ccObj.SFDC_QC_Status__c='Manual QC';
+                                ccObj.VCIP_Status__c='VCIP_REJECTED';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                                
+                            }
+                            else if(think.VCIP_Status__c=='Checker Pending'){
+                                ccObj.SFDC_QC_Status__c='Manual QC';
+                                ccObj.VCIP_Status__c='Checker Pending';
+                                ccObj.Integration_Status__c='Think Analytics Integration executed successfully';
+                                
+                            }
+                            else if(!(taVCIPStatus.equalsIgnoreCase('Checker Pending') ||taVCIPStatus.equalsIgnoreCase('VCIP_APPROVED')|| taVCIPStatus.equalsIgnoreCase('VCIP_REJECTED'))){
+                                integrationLogger.CC_App_Data__c =ccObj.Id;                                    
+                        		integrationLogger.Application_No__c =ccObj.Application_Reference_number__c;
+                                commitIntegrationLogger(integrationloggerlist,integrationLogger);
+                                
+                                apiResponse.vcipStatus=request.vcipStatus;
+                    			apiResponse.customerId=request.customerId;
+                    			apiResponse.Status='Error Found';
+                                apiResponse.ErrorInfo='Please send correct VCIP Status';
+                                return apiResponse;
+                                //isInsert=false;
+                            }
+                            
+                        }
+                        
+                        
+                        integrationLogger.CC_App_Data__c =ccObj.Id;                                    
+                        integrationLogger.Application_No__c =ccObj.Application_Reference_number__c;
+                        
+                        onlyTAData=false;
+                        apiResponse.ErrorInfo = System.Label.Think_Analytics_No_Application;
+                        apiResponse.Status='Success';
+                        insert think;
+                         
+                        update ccObj;
+                    }
+                    
+                   		Think_Analytics__c think = new Think_Analytics__c();
+                        think.BFLUniqueId__c=request.customerId;
+                        think.VCIP_Status__c=request.vcipStatus;
+                        think.Name='Think Analytics from BFL-'+Datetime.now().format();
+                    	taVCIPStatus=request.vcipStatus;
+                    	
+                    
+                    if(! (taVCIPStatus.equalsIgnoreCase('Checker Pending') || taVCIPStatus.equalsIgnoreCase('VCIP_APPROVED') || taVCIPStatus.equalsIgnoreCase('VCIP_REJECTED'))){
+                        apiResponse.ErrorInfo = 'Please send correct VCIP Status';
+                        apiResponse.Status='Error found for insert TA data';
+                    }
+                    else if(onlyTAData){
+                        apiResponse.ErrorInfo = System.Label.Think_Analytics_No_Application;
+                        apiResponse.Status=System.Label.Think_Analytics_Success_Status;
+                        insert think;
+                    }
+                    	//insert think;
+                    
+                    // app1.performPlatformEventForStatus('Think Analytics Integration completed successfully');
+                    apiResponse.vcipStatus=request.vcipStatus;
+                    apiResponse.customerId=request.customerId;
+                    //apiResponse.Status=System.Label.Think_Analytics_Success_Status;
+                    //apiResponse.ErrorInfo = System.Label.Think_Analytics_No_Application;
+                    
+                }
+                
+            }
+            
+            
+        }
+        Catch(Exception e){
+            
+            
+            
+            IntegrationLogrWrapper.IntegrationErrorlog errorlogWrap = new IntegrationLogrWrapper.IntegrationErrorlog();
+            
+            errorlogWrap.ErrorMsg = e.getStackTraceString();
+            errorlogWrap.errorTime=startTime;
+            errorlogWrap.lineNum=e.getLineNumber();
+            errorlogWrap.message=e.getMessage();
+            errorlogWrap.logName='Think Analytics Errorlog';
+            errorLogMap = CommonUtil.logErrorInfo(errorlogWrap);
+            ErrorlogList.add(errorLogMap.get('IntegrationErrorLog'));
+            insert ErrorlogList;
+            
+            apiResponse.customerId = System.Label.Think_Analytics_No_Response_From_Server;
+            apiResponse.ErrorInfo = e.getMessage();
+            
+            return apiResponse;
+            
+        }
+        
+        commitIntegrationLogger(integrationloggerlist,integrationLogger);
+        return apiResponse;
+    }
+    
+    private static Boolean checkParameterValidations(ThinkAnalyticsWebserviceReqGen apiRequest){
+        //Check if Mandatory Fields missing
+        Map<String,String> mandatoryData = new Map<String,String>();
+        mandatoryData.put('customerId',apiRequest.customerId);
+        mandatoryData.put('vcipStatus',apiRequest.vcipStatus);
+        
+        
+        for(String keyset : mandatoryData.keyset()){
+            if(String.isBlank(mandatoryData.get(keyset))){
+                apiResponse.customerId = apiRequest.customerId;
+                apiResponse.ErrorInfo = System.Label.Think_Analytics_Missing_Requred_Parameters + ' : ' + keyset;
+                apiResponse.vcipStatus= apiRequest.vcipStatus; //System.Label.Think_Analytics_Missing_Requred_Parameters	 
+                apiResponse.Status=System.Label.Think_Analytics_Missing_Requred_Parameters;
+                return false;
+            }
+        }       
+        
+        return true;
+    }
+    
+    
+    private static void commitIntegrationLogger(List<Integration_Logger__c> integrationloggerlist,Integration_Logger__c integrationLogger){
+        integrationLogger.Status__c = IntegrationConstants.INTEGRATION_LOGGER_SUCCESS;  
+        integrationLogger.Response__c = String.valueOf(apiResponse);
+        integrationLogger.End_Time__c = System.now();
+        integrationloggerlist.add(integrationLogger); 
+        
+        Database.DMLOptions dml = new Database.DMLOptions();
+        dml.AllowFieldTruncation = true;
+        if(integrationloggerlist != null && integrationloggerlist.size() > 0){
+            Database.SaveResult[] srList = Database.insert(integrationloggerlist,dml);
+        } 
+    }
+    
+    private static ThinkAnalyticsWebserviceResGen returnResponse(ThinkAnalyticsWebserviceReqGen request){
+        ThinkAnalyticsWebserviceResGen returnResponse=new ThinkAnalyticsWebserviceResGen();
+        returnResponse.vcipStatus=request.vcipStatus;
+        returnResponse.customerId=request.customerId;
+        taVCIPStatusforReturnMethod=request.vcipStatus;
+        if(!isInsert){
+            returnResponse.Status='Error Found for insert data';
+        }
+        else{
+            returnResponse.Status=System.Label.Think_Analytics_Success_Status;
+        }
+        
+        if(!isRecordPresent){
+            returnResponse.ErrorInfo='Final Data Push Already Completed';
+        }
+        else if(! (taVCIPStatusforReturnMethod.equalsIgnoreCase('Checker Pending') ||taVCIPStatusforReturnMethod.equalsIgnoreCase('VCIP_APPROVED')|| taVCIPStatusforReturnMethod.equalsIgnoreCase('VCIP_REJECTED'))){
+            
+            returnResponse.ErrorInfo = 'Please send correct VCIP Status';
+        }
+        else{
+            returnResponse.ErrorInfo=System.Label.Think_Analytics_No_Error;
+        }
+        
+        
+        return returnResponse;
+    } 
+    
+}
