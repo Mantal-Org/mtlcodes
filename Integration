@@ -1,0 +1,132 @@
+Web server flow /Authorization code grant flow
+
+part of OAuth 2.0`, when client app(web app) can sfely stores secretes and need to acess the salesforce data on behalf of user.
+sprecillay the Applictaion runs secure server (hosted in Amzon,azure ,heroku etc).
+salesforce has same ability to save the secrete flow
+  
+  
+steps : intent is need to Acess data for that u have choseen the Login with Salesforce
+
+1.Client asks Authorization server for permission(clientid,scope,redirect url)
+
+2.login page and need your consent(ligin page then ask for permission Allow or deny)
+
+3.redirct the browser to redirct url of the client app(it will share single use authoriztion code in not permantae one)
+
+4.client exchange code  Access token /secure back channel access(client has acess token so he can able 
+
+5.Access Token and refersh token issued  now he can able to get data from server
+
+disAdvantages
+1.secured server requred
+2.not for headless app(like middle ware  ETL TOOL ...().MEAN need user interaction)
+3.broweser interaction needed(need to provide consent)
+4.strict configuration required(redirect uri 	)
+
+
+Implicit flow (UserAgent flow)-->Deprecated 
+
+used in browser based or mobile apps that can not store secrets and need acess tokens. 
+not secure bcz secrets not stores that secrets communitcated through  url and that is dirct access token not  single use authoriztion code
+
+steps
+
+1.login with salesforce --->
+
+2.client side spa ( client _id,redircturl ,reponse_type=token )
+
+3.the user log in and approves the acess in sfdc (insted of redircting with single use authorization code,user backs to aplliction with accesstoken 
+in url dirctly
+
+disadvantatge 
+
+no refresh token (but sfdc allows)
+insted use pkce flow
+
+
+PKCE FLOW
+proof key for code Exchange
+
+generally pixcy flow  its security extention authorization server flow
+
+use case:dont have a secure server to store your client is and secrests (broweswer based app or mobile based app) also above the implicit grant flow
+
+PKCE mecahnism basically two things 1.code_verifier and 2. code_challenge
+both are one time parameter unique and combination of both demonstrate to  the Authorization sever that authorization code request  and subsequent token 
+request made in same  entity
+
+
+1.Code_verifier(secret)--> the client application  genertares and securely  stores  the code verifier ,which is typically an  random string
+used just once . the client must be  able to generate  and securely store the value 
+2.code_challenge(public value)-->then client create the code_challenge  from code_verifier . this is done by hashing the code_verifier using SHA -256
+  algorithm and then base 64 encoding with the hash
+
+
+steps
+
+flow begains the client app  sends authorization code request to  Authorization server  including client id  redirecturl and code challange .
+Authorization server  stores  thsi code_challenge to check latter
+
+2.Authorization server  verifies   the user login nd scopes approval
+
+3. After consent then Authorization server redirectback to client  redirect url  with authorization cocde.
+
+4.once the authorization code is with u client app initiates post requests to Authorization  server token endpoint 
+which include( authorization code ,client id ,matching  redirect uri  and crucially  original unhashed  code_verifier
+
+5. Authorization server validate request parameter and then performs  the central PKCE check(hashes the code_verifier. and compare the resulting hashes
+against the   code_challenge submitted  in the initial request
+
+6. if all access matches then isuue the access token and  refresh token
+
+
+Client Credential flow
+
+when ever the authorization machine to machine then it fits.maean the requester is Machine
+
+no real time user  intarction is required and  .the flow authenticates  it self with authorization server by client id and client secret 
+
+steps 
+ 
+1.client sends clientId ,clientSecret, endpoint  with http post call   with specify as grant_type  ='Client_credentials'
+2.then requet sent to Authorix=zation servers it verifies and send  access token 
+
+but salesforce recomend that we need  a execution user as integertion user licence(API only User permission) for auditability, tracing and  all
+
+
+JWT  Token Bearer flow
+
+JSON Web Token
+
+design for server to server interactin  where appliction doesnot need access the data  with out real tien user interaction
+
+consider more secure as u dont need the client id rather private key
+
+insted of user  entering  credential or approving the accesss in browser ,the client appliction  signs  a token  with digital  certificate
+to prove identity
+
+ideal for automated process  such as middleware (ETL-EXTRACT TRANSFORM LOAD  TOOLS ,comtinues integration servers  or daemons  that run in background
+that no Allow consent is required 
+
+
+structure of JWT
+
+1. Header (contains info which algorithm  is used for signin request ex: RS 256)
+2. payload (conatis the  claims info  by using parameter ex({"iss,sub,aud,exp"}) ex:{Iss:OAuth client_id ,
+                                                                                         aud: Authorization server url,
+																						 sub:userúserName
+																						 exp:Token expiry unix time
+																				     }
+																					 )
+																					 
+																					 
+																					 
+																					 
+
+3. signature (contains 3 part ex: HMACSH256(base 64 Urlencoder(Header)+""+base64(URLEncode(payload),privatekey)))
+
+steps 
+1. client will create JSOnobject and claims
+2. sign JWT with private key(post call)
+3. Token request  (grant type and assertion)
+4. Token response (Note:every time new access token no refereh token)
